@@ -1,0 +1,285 @@
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel ComputeMeanPos
+#pragma kernel ComputeCovariance
+#pragma kernel GetDensity
+#pragma kernel BlurDensity
+
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+
+static const int NumThreads = 64;
+RWTexture3D<float> DensityMap;
+RWTexture3D<float> BlurDensityMap;
+uint3 resolution;
+float3 minPos;
+float3 size;
+float smoothingRadius;
+float numParticles;
+int number;
+int radius;
+
+RWStructuredBuffer<float3> PredictedPositions;
+RWStructuredBuffer<uint3> SpatialIndices;
+RWStructuredBuffer<uint> SpatialOffsets;
+RWStructuredBuffer<float3> MeanPositions;
+RWStructuredBuffer<float3x3> Covariance;
+
+#include "./FluidMaths3D.hlsl"
+#include "./SpatialHash3D.hlsl"
+#include "Math.cginc"
+
+static const float EVD_EPS = 1e-6;
+
+
+float3x3 OuterProduct(float3 a)
+{
+    return float3x3(
+        a.x * a.x, a.x * a.y, a.x * a.z,
+        a.y * a.x, a.y * a.y, a.y * a.z,
+        a.z * a.x, a.z * a.y, a.z * a.z
+    );
+}
+
+static const float EPS_RHO = 1e-5;
+static const float EPS_TRACE = 1e-12;
+static const float LAMBDA_MIN = 0.1;
+
+float trace3(float3x3 M)
+{
+    return M[0][0] + M[1][1] + M[2][2];
+}
+
+
+float3x3 normalize_trace(float3x3 M)
+{
+    float t = trace3(M) * (1.0 / 3.0);
+    t = max(t, EPS_TRACE);
+    return M * (1.0 / t);
+}
+
+float3x3 V_diag_Vt(float3x3 V, float3 d)
+{
+    float3x3 VD = V;
+    VD[0][0] *= d.x;
+    VD[1][0] *= d.x;
+    VD[2][0] *= d.x; // col0 *= d.x
+    VD[0][1] *= d.y;
+    VD[1][1] *= d.y;
+    VD[2][1] *= d.y; // col1 *= d.y
+    VD[0][2] *= d.z;
+    VD[1][2] *= d.z;
+    VD[2][2] *= d.z; // col2 *= d.z
+
+    // (V*D) * V^T
+    return mul(VD, transpose(V));
+}
+
+
+
+[numthreads(NumThreads, 1, 1)]
+void ComputeMeanPos(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= number)
+        return;
+    float3 pos = PredictedPositions[id.x];
+    int3 originCell = GetCell3D(pos, smoothingRadius);
+    float sqrRadius = smoothingRadius * smoothingRadius;
+    float rho = 0;
+    float3 meanPos = float3(0, 0, 0);
+
+	// Neighbour search
+    for (int i = 0; i < 27; i++)
+    {
+        uint hash = HashCell3D(originCell + offsets3D[i]);
+        uint key = KeyFromHash(hash, numParticles);
+        uint currIndex = SpatialOffsets[key];
+
+        while (currIndex < numParticles)
+        {
+            uint3 indexData = SpatialIndices[currIndex];
+            currIndex++;
+			// Exit if no longer looking at correct bin
+            if (indexData[2] != key)
+                break;
+			// Skip if hash does not match
+            if (indexData[1] != hash)
+                continue;
+
+            uint neighbourIndex = indexData[0];
+            float3 neighbourPos = PredictedPositions[neighbourIndex];
+            float3 offsetToNeighbour = neighbourPos - pos;
+            float sqrDstToNeighbour = dot(offsetToNeighbour, offsetToNeighbour);
+
+			// Skip if not within radius
+            if (sqrDstToNeighbour > sqrRadius)
+                continue;
+
+			// Calculate density and near density
+            float dst = sqrt(sqrDstToNeighbour);
+            float w = DensityKernel(dst, smoothingRadius);
+            meanPos += neighbourPos * w;
+            rho += w;
+
+        }       
+    }
+    MeanPositions[id.x] = rho > 1e-5f ? meanPos / rho : pos;
+}
+
+
+[numthreads(NumThreads, 1, 1)]
+void ComputeCovariance(uint3 id : SV_DispatchThreadID){
+    if (id.x >= number)
+        return;
+    float3 pos = PredictedPositions[id.x];
+    float3 meanPos = MeanPositions[id.x];
+    int3 originCell = GetCell3D(pos, smoothingRadius);
+    float sqrRadius = smoothingRadius * smoothingRadius;
+    float rho = 0;
+    float3x3 covariance = float3x3(0, 0, 0,
+                                   0, 0, 0,
+                                   0, 0, 0);
+
+	// Neighbour search
+    for (int i = 0; i < 27; i++)
+    {
+        uint hash = HashCell3D(originCell + offsets3D[i]);
+        uint key = KeyFromHash(hash, numParticles);
+        uint currIndex = SpatialOffsets[key];
+
+        while (currIndex < numParticles)
+        {
+            uint3 indexData = SpatialIndices[currIndex];
+            currIndex++;
+			// Exit if no longer looking at correct bin
+            if (indexData[2] != key)
+                break;
+			// Skip if hash does not match
+            if (indexData[1] != hash)
+                continue;
+
+            uint neighbourIndex = indexData[0];
+            float3 neighbourPos = PredictedPositions[neighbourIndex];
+            float3 offsetToNeighbour = neighbourPos - pos;
+            float sqrDstToNeighbour = dot(offsetToNeighbour, offsetToNeighbour);
+
+			// Skip if not within radius
+            if (sqrDstToNeighbour > sqrRadius)
+                continue;
+
+			// Calculate density and near density
+            float dst = sqrt(sqrDstToNeighbour);
+            float w = DensityKernel(dst, smoothingRadius);
+            covariance += OuterProduct(offsetToNeighbour) * w;
+            rho += w;
+        }
+    }
+    
+    if (rho > EPS_RHO)
+    {
+        covariance *= (1.0 / rho);
+    }
+    else
+    {
+        covariance = float3x3(1, 0, 0,
+                              0, 1, 0,
+                              0, 0, 1);
+    }
+    
+    covariance = normalize_trace(covariance);
+
+    // EVD: cov = V * diag(lambda) * V^T
+    float3 lambda;
+    float3x3 V;
+    float3x3 U;
+    GetSVD3D(covariance,U,lambda,V);   
+    float3 invLam = 1.0 / max(lambda, float3(LAMBDA_MIN, LAMBDA_MIN, LAMBDA_MIN));
+    covariance = V_diag_Vt(U, invLam);
+    covariance = normalize_trace(covariance);
+
+    Covariance[id.x] = covariance;
+
+}
+
+
+
+[numthreads(8, 8, 8)]
+void GetDensity (uint3 id : SV_DispatchThreadID){    
+    if (id.x >= resolution.x || id.y >= resolution.y || id.z >= resolution.z)
+        return;
+        
+    float3 pos = minPos + size * (float3) id;
+    
+    int3 originCell = GetCell3D(pos, smoothingRadius);
+    float sqrRadius = smoothingRadius * smoothingRadius;
+    float density = 0;
+
+	// Neighbour search
+    for (int i = 0; i < 27; i++)
+    {
+        uint hash = HashCell3D(originCell + offsets3D[i]);
+        uint key = KeyFromHash(hash, numParticles);
+        uint currIndex = SpatialOffsets[key];
+
+        while (currIndex < numParticles)
+        {
+            uint3 indexData = SpatialIndices[currIndex];
+            currIndex++;
+			// Exit if no longer looking at correct bin
+            if (indexData[2] != key)
+                break;
+			// Skip if hash does not match
+            if (indexData[1] != hash)
+                continue;
+
+            uint neighbourIndex = indexData[0];
+            float3 neighbourPos = PredictedPositions[neighbourIndex];
+            float3 offsetToNeighbour = (neighbourPos - pos);
+            float3 projectionPos = mul((Covariance[neighbourIndex]), offsetToNeighbour);
+            float sqrDstToNeighbour = dot(projectionPos, projectionPos);
+
+			// Skip if not within radius
+            if (sqrDstToNeighbour > sqrRadius)
+                continue;
+
+			// Calculate density and near density
+            float dst = sqrt(sqrDstToNeighbour);
+            density += DensityKernel(dst, smoothingRadius);
+ 
+        }
+    }
+    
+    
+    DensityMap[id] = density;    
+}
+
+bool IsInsideBoundary(int3 pos){
+    if (pos.x < 0 || pos.y < 0 || pos.z < 0 || pos.x >= resolution.x || pos.y >= resolution.y || pos.z >= resolution.z)
+        return false;
+    return true;
+
+}
+
+[numthreads(8, 8, 8)]
+void BlurDensity(uint3 id : SV_DispatchThreadID){
+    if (id.x >= resolution.x || id.y >= resolution.y || id.z >= resolution.z)
+        return;
+
+    float density = 0;
+    float count = 0;
+    for (int z = -radius; z <= radius; z++){
+        for (int y = -radius; y <= radius; y++){
+            for (int x = -radius; x <= radius; x++){
+                int3 pos = id + int3(x, y, z);
+                if (IsInsideBoundary(pos)){
+                    density += DensityMap[pos];
+                    count += 1;
+                }
+            }
+        }
+    }
+    
+    BlurDensityMap[id] = density / count;
+}
+
+
+

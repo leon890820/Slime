@@ -1,0 +1,93 @@
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel MarchingCube
+#include "MarchingTable.compute"
+
+
+
+struct Triangle {
+    float3 pointA;
+    float3 pointB;
+    float3 pointC;
+};
+
+Texture3D<float> density;
+AppendStructuredBuffer<Triangle> triangles;
+int3 numVoxelPerAxis;
+float isoLevel;
+SamplerState linearClampSampler;
+float3 minPos;
+float3 size;
+    
+int CoordToIndex(int x, int y, int z){
+    return z * (numVoxelPerAxis.z + 1) * (numVoxelPerAxis.y + 1) + y * (numVoxelPerAxis.x + 1) + x;
+}
+
+bool OutOfBoundary(int3 pos){
+    return pos.x >= numVoxelPerAxis.x || pos.y >= numVoxelPerAxis.y || pos.z >= numVoxelPerAxis.z;
+}
+
+float3 interpolateVerts(float4 v1, float4 v2) {    
+     float t = (isoLevel - v1.w) / (v2.w - v1.w);
+     return v1.xyz + t * (v2.xyz-v1.xyz);
+}
+
+float3 GetPosition(uint3 coord){
+    return minPos + (float3) coord * size;
+}
+
+float SampleDensity(uint3 coord){
+    bool isEdge = any(coord <= 0 || coord >= numVoxelPerAxis - 1);
+    if (isEdge) return isoLevel;
+    float3 uvw = (float3) coord / (float3) (numVoxelPerAxis);
+    return -density.SampleLevel(linearClampSampler, uvw, 0);
+}
+
+[numthreads(8, 8, 8)]
+void MarchingCube (uint3 id : SV_DispatchThreadID){
+    if(OutOfBoundary(id)) return;
+    float4 corners[8] = {
+        float4(GetPosition(uint3(id.x,     id.y,     id.z    )), SampleDensity(uint3(id.x,     id.y,     id.z    ))),
+        float4(GetPosition(uint3(id.x + 1, id.y,     id.z    )), SampleDensity(uint3(id.x + 1, id.y,     id.z    ))),
+        float4(GetPosition(uint3(id.x + 1, id.y,     id.z + 1)), SampleDensity(uint3(id.x + 1, id.y,     id.z + 1))),
+        float4(GetPosition(uint3(id.x,     id.y,     id.z + 1)), SampleDensity(uint3(id.x,     id.y,     id.z + 1))),
+        float4(GetPosition(uint3(id.x,     id.y + 1, id.z    )), SampleDensity(uint3(id.x,     id.y + 1, id.z    ))),
+        float4(GetPosition(uint3(id.x + 1, id.y + 1, id.z    )), SampleDensity(uint3(id.x + 1, id.y + 1, id.z    ))),
+        float4(GetPosition(uint3(id.x + 1, id.y + 1, id.z + 1)), SampleDensity(uint3(id.x + 1, id.y + 1, id.z + 1))),
+        float4(GetPosition(uint3(id.x,     id.y + 1, id.z + 1)), SampleDensity(uint3(id.x,     id.y + 1, id.z + 1)))
+
+    };
+
+    int triIndexNum = 0;
+    if(corners[0].w < isoLevel) triIndexNum |= 1;
+    if(corners[1].w < isoLevel) triIndexNum |= 2;
+    if(corners[2].w < isoLevel) triIndexNum |= 4;
+    if(corners[3].w < isoLevel) triIndexNum |= 8;
+    if(corners[4].w < isoLevel) triIndexNum |= 16;
+    if(corners[5].w < isoLevel) triIndexNum |= 32;
+    if(corners[6].w < isoLevel) triIndexNum |= 64;
+    if(corners[7].w < isoLevel) triIndexNum |= 128;
+    
+    
+
+    for(int i = 0; triangulation[triIndexNum][i] != -1; i += 3){
+        int a0 = cornerIndexAFromEdge[triangulation[triIndexNum][i + 0]];
+        int b0 = cornerIndexBFromEdge[triangulation[triIndexNum][i + 0]];
+
+        int a1 = cornerIndexAFromEdge[triangulation[triIndexNum][i + 1]];
+        int b1 = cornerIndexBFromEdge[triangulation[triIndexNum][i + 1]];
+
+        int a2 = cornerIndexAFromEdge[triangulation[triIndexNum][i + 2]];
+        int b2 = cornerIndexBFromEdge[triangulation[triIndexNum][i + 2]];
+
+        float3 p0 = interpolateVerts(corners[a0] , corners[b0]);
+        float3 p1 = interpolateVerts(corners[a1] , corners[b1]);
+        float3 p2 = interpolateVerts(corners[a2] , corners[b2]);
+
+        Triangle tri;
+        tri.pointA = p0; tri.pointB = p1; tri.pointC = p2;
+        triangles.Append(tri);
+    }
+
+}
+
+
